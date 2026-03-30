@@ -1,3 +1,17 @@
+# ============================================================================
+# Height & Weight Prediction Model Training Script
+# 
+# This script trains a neural network to predict a person's height and weight
+# from body pose keypoints extracted using YOLOv8-Pose.
+#
+# Pipeline:
+#   1. Load labeled training images (with known height/weight)
+#   2. Extract 17 body keypoints per image using YOLOv8-Pose
+#   3. Flatten keypoints into a 34-feature vector (x, y per keypoint)
+#   4. Train a fully connected regression network to map keypoints → (height, weight)
+#   5. Save the trained model, loss curves, and prediction results
+# ============================================================================
+
 import os
 import numpy as np
 import pandas as pd
@@ -7,19 +21,19 @@ from torch.utils.data import Dataset, DataLoader
 from ultralytics import YOLO
 import cv2
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # Use non-interactive backend (no GUI required)
 import matplotlib.pyplot as plt
 
 # --- Config ---
-CSV_FILE = "./training_data/labels.csv"
-IMAGE_FOLDER = "./training_data/images"
-POSE_MODEL_PATH = "yolov8n-pose.pt"
-SAVE_PATH = "height_weight_model.pt"
-OUTPUT_DIR = "./training_output"
-KEYPOINTS_DIR = os.path.join(OUTPUT_DIR, "keypoints")
-EPOCHS = 200
-BATCH_SIZE = 4
-LEARNING_RATE = 0.001
+CSV_FILE = "./training_data/labels.csv"         # CSV with columns: image, height, weight
+IMAGE_FOLDER = "./training_data/images"          # Directory containing training images
+POSE_MODEL_PATH = "./training_data/yolov8n-pose.pt"              # Pre-trained YOLOv8 pose estimation model
+SAVE_PATH = "./model_output/height_weight_model.pt"              # Output path for the trained regression model
+OUTPUT_DIR = "./training_output"                  # Directory for training artifacts (plots, CSVs)
+KEYPOINTS_DIR = os.path.join(OUTPUT_DIR, "keypoints")  # Directory for keypoint visualizations
+EPOCHS = 200                                      # Number of training epochs
+BATCH_SIZE = 4                                    # Mini-batch size for DataLoader
+LEARNING_RATE = 0.001                             # Adam optimizer learning rate
 
 # --- Create output directories ---
 os.makedirs(KEYPOINTS_DIR, exist_ok=True)
@@ -28,8 +42,9 @@ os.makedirs(KEYPOINTS_DIR, exist_ok=True)
 yolo_pose = YOLO(POSE_MODEL_PATH)
 
 
-# --- Extract keypoints using YOLOv8-Pose ---
-# COCO 17 keypoint skeleton connections
+# --- Skeleton & Keypoint Definitions ---
+# COCO 17-keypoint skeleton connections (pairs of keypoint indices)
+# Used for drawing the pose skeleton on annotated images
 SKELETON = [
     (0, 1), (0, 2), (1, 3), (2, 4),        # head
     (5, 6),                                   # shoulders
@@ -39,6 +54,7 @@ SKELETON = [
     (11, 13), (13, 15), (12, 14), (14, 16),  # legs
 ]
 
+# COCO keypoint names (index 0–16), mapped to body joints
 KEYPOINT_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
     "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -48,48 +64,62 @@ KEYPOINT_NAMES = [
 
 
 def draw_keypoints_on_image(image_path, keypoints_xy, save_path):
-    """Draw keypoints and skeleton on image and save."""
+    """Draw detected keypoints and skeleton connections on the original image.
+    
+    Args:
+        image_path: Path to the original image file.
+        keypoints_xy: Normalized keypoint coordinates, shape (17, 2) with values in [0, 1].
+        save_path: Output path for the annotated image.
+    """
     img = cv2.imread(image_path)
     if img is None:
         return
     h, w = img.shape[:2]
 
-    # keypoints_xy is shape (17, 2) normalized
+    # Convert normalized (0–1) keypoints to pixel coordinates
     pts = []
     for i in range(17):
         x = int(keypoints_xy[i][0] * w)
         y = int(keypoints_xy[i][1] * h)
         pts.append((x, y))
-        if x > 0 or y > 0:  # only draw if detected
-            cv2.circle(img, (x, y), 5, (0, 255, 0), -1)
-            cv2.putText(img, f"{i}", (x + 6, y - 6),
+        if x > 0 or y > 0:  # Only draw if the keypoint was detected
+            cv2.circle(img, (x, y), 5, (0, 255, 0), -1)       # Green dot
+            cv2.putText(img, f"{i}", (x + 6, y - 6),          # Keypoint index label
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
-    # Draw skeleton
+    # Draw skeleton lines between connected keypoints
     for (a, b) in SKELETON:
         if (pts[a][0] > 0 or pts[a][1] > 0) and (pts[b][0] > 0 or pts[b][1] > 0):
-            cv2.line(img, pts[a], pts[b], (0, 200, 255), 2)
+            cv2.line(img, pts[a], pts[b], (0, 200, 255), 2)   # Orange line
 
     cv2.imwrite(save_path, img)
 
 
 def extract_keypoints(image_path, save_vis=True):
-    """Extract 17 keypoints (x, y) from YOLOv8-Pose → 34 features.
-    Optionally save annotated image with keypoints drawn."""
+    """Run YOLOv8-Pose on an image and extract normalized keypoint features.
+
+    Args:
+        image_path: Path to the input image.
+        save_vis: If True, save an annotated image with keypoints overlaid.
+
+    Returns:
+        A flat numpy array of 34 values (17 keypoints × 2 coords), or None if
+        no valid pose was detected.
+    """
     results = yolo_pose(image_path, verbose=False)
     result = results[0]
 
     if result.keypoints is None or len(result.keypoints) == 0:
         return None
 
-    # Take the first detected person's keypoints
+    # Use the first detected person; xyn gives normalized (0–1) coordinates
     kps_raw = result.keypoints[0].xyn.cpu().numpy().squeeze()  # shape (17, 2)
-    kps = kps_raw.flatten()  # normalized (x, y) * 17 = 34 values
+    kps = kps_raw.flatten()  # Flatten to 34 features: [x0, y0, x1, y1, ..., x16, y16]
 
     if len(kps) != 34 or np.all(kps == 0):
         return None
 
-    # Save keypoint visualization
+    # Save keypoint visualization for debugging / inspection
     if save_vis:
         img_name = os.path.basename(image_path)
         save_path = os.path.join(KEYPOINTS_DIR, f"keypoints_{img_name}")
@@ -100,19 +130,22 @@ def extract_keypoints(image_path, save_vis=True):
 
 
 # --- PyTorch Regression Model ---
+# A 4-layer fully connected network: 34 → 128 → 64 → 32 → 2
+# Input:  34 normalized keypoint features
+# Output: 2 values — predicted (height, weight) in normalized space
 class HeightWeightNet(nn.Module):
     def __init__(self, input_dim=34):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.2),       # Regularization to prevent overfitting
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 2),  # output: [height, weight]
+            nn.Linear(32, 2),      # Output: [height, weight]
         )
 
     def forward(self, x):
@@ -120,10 +153,11 @@ class HeightWeightNet(nn.Module):
 
 
 # --- Custom Dataset ---
+# Wraps keypoint features and labels into a PyTorch Dataset for batched loading
 class PoseDataset(Dataset):
     def __init__(self, features, labels):
-        self.X = torch.FloatTensor(features)
-        self.y = torch.FloatTensor(labels)
+        self.X = torch.FloatTensor(features)  # Shape: (N, 34)
+        self.y = torch.FloatTensor(labels)    # Shape: (N, 2) — normalized height & weight
 
     def __len__(self):
         return len(self.X)
@@ -132,12 +166,14 @@ class PoseDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-# --- Load Dataset ---
+# --- Load Dataset & Extract Features ---
+# Read the CSV containing image filenames, heights, and weights.
+# For each image, run YOLOv8-Pose to extract keypoints as input features.
 df = pd.read_csv(CSV_FILE)
 print(f"Loaded {len(df)} samples from {CSV_FILE}")
 
-features_list = []
-labels_list = []
+features_list = []  # Will hold 34-dim keypoint vectors
+labels_list = []    # Will hold (height, weight) pairs
 skipped = 0
 
 for _, row in df.iterrows():
@@ -161,10 +197,12 @@ if len(features_list) < 2:
 X = np.array(features_list)
 y = np.array(labels_list)
 
-# --- Normalize labels for better training ---
+# --- Normalize labels (z-score) for stable gradient descent ---
+# Heights and weights have different scales, so we standardize them
+# to zero mean and unit variance. Stats are saved with the model for inference.
 y_mean = y.mean(axis=0)
 y_std = y.std(axis=0)
-y_std[y_std == 0] = 1  # avoid division by zero
+y_std[y_std == 0] = 1  # Avoid division by zero if all values are identical
 y_norm = (y - y_mean) / y_std
 
 # --- Create DataLoader ---
@@ -172,13 +210,15 @@ dataset = PoseDataset(X, y_norm)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # --- Train ---
+# Use Apple Silicon GPU (MPS) if available, otherwise fallback to CPU
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Training on: {device}")
 
 model = HeightWeightNet(input_dim=34).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-loss_fn = nn.MSELoss()
+loss_fn = nn.MSELoss()  # Mean Squared Error — standard for regression
 
+# Training loop
 model.train()
 epoch_losses = []
 for epoch in range(EPOCHS):
@@ -186,18 +226,19 @@ for epoch in range(EPOCHS):
     for batch_X, batch_y in dataloader:
         batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-        pred = model(batch_X)
+        pred = model(batch_X)        # Forward pass
         loss = loss_fn(pred, batch_y)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad()         # Clear previous gradients
+        loss.backward()               # Backpropagation
+        optimizer.step()              # Update weights
 
         total_loss += loss.item()
 
     avg_loss = total_loss / len(dataloader)
     epoch_losses.append(avg_loss)
 
+    # Print progress every 20 epochs
     if (epoch + 1) % 20 == 0:
         print(f"Epoch {epoch+1}/{EPOCHS} — Loss: {avg_loss:.6f}")
 
@@ -221,11 +262,13 @@ loss_df.to_csv(loss_csv_path, index=False)
 print(f"Epoch losses saved → {loss_csv_path}")
 
 # --- Evaluate on full dataset ---
+# Run inference on all training samples and denormalize predictions
+# back to original scale (cm for height, kg for weight)
 model.eval()
 with torch.no_grad():
     X_tensor = torch.FloatTensor(X).to(device)
     preds_norm = model(X_tensor).cpu().numpy()
-    preds = preds_norm * y_std + y_mean  # denormalize
+    preds = preds_norm * y_std + y_mean  # Reverse z-score normalization
 
 print("\n--- Predictions vs Actual ---")
 results_rows = []
@@ -248,14 +291,17 @@ pd.DataFrame(results_rows).to_csv(results_csv_path, index=False)
 print(f"\nPredictions saved → {results_csv_path}")
 
 # --- Save predictions comparison plot ---
+# Side-by-side bar charts comparing actual vs predicted for height and weight
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
+# Height comparison (left chart)
 axes[0].bar(range(len(y)), y[:, 0], alpha=0.6, label="Actual", width=0.4)
 axes[0].bar([x + 0.4 for x in range(len(y))], preds[:, 0], alpha=0.6, label="Predicted", width=0.4)
 axes[0].set_title("Height (cm)")
 axes[0].set_xlabel("Sample")
 axes[0].legend()
 
+# Weight comparison (right chart)
 axes[1].bar(range(len(y)), y[:, 1], alpha=0.6, label="Actual", width=0.4)
 axes[1].bar([x + 0.4 for x in range(len(y))], preds[:, 1], alpha=0.6, label="Predicted", width=0.4)
 axes[1].set_title("Weight (kg)")
@@ -269,6 +315,8 @@ plt.close()
 print(f"Predictions plot saved → {pred_plot_path}")
 
 # --- Save model + normalization stats ---
+# The checkpoint includes the model weights along with the mean/std used for
+# label normalization, so predictions can be correctly denormalized at inference.
 torch.save({
     "model_state": model.cpu().state_dict(),
     "y_mean": torch.tensor(y_mean, dtype=torch.float32),

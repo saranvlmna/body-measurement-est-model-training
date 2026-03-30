@@ -11,7 +11,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 app = FastAPI()
 
 # --- YOLOv8-Pose model ---
-POSE_MODEL_PATH = "yolov8n-pose.pt"
+POSE_MODEL_PATH = "./training_data/yolov8n-pose.pt"
 yolo_pose = YOLO(POSE_MODEL_PATH)
 
 
@@ -36,7 +36,7 @@ class HeightWeightNet(nn.Module):
 
 
 # --- Load trained model ---
-MODEL_PATH = "height_weight_model.pt"
+MODEL_PATH = "./model_output/height_weight_model.pt"
 model = None
 y_mean = None
 y_std = None
